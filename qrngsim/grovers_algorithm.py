@@ -327,7 +327,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    """Run QRNG + ECDH + Grover-only assessment."""
+    """Run QRNG + ECDH + Grover assessment."""
     args = parse_args()
     try:
         material = create_qrng_ecdh_scalar(
@@ -347,7 +347,7 @@ def main() -> None:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1)
 
-    print("QRNG + ECDH Grover-Only Assessment")
+    print("QRNG + ECDH Grover Assessment")
     print("=" * 64)
     print(f"Curve: {ecdh.curve_name}")
     print(f"Curve order bits: {ecdh.order_bits}")
@@ -385,7 +385,7 @@ def main() -> None:
     )
     print(f"QRNG predictability assessment: {qrng_predictability.reason}")
     print(
-        "FINAL RESULT - QRNG+ECDH broken by Grover-only attack:",
+        "FINAL RESULT - QRNG+ECDH broken by Grover attack:",
         "YES" if estimate.practical_break else "NO",
     )
 

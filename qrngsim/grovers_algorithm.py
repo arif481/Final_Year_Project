@@ -64,6 +64,15 @@ class GroverEstimate:
     reason: str
 
 
+@dataclass
+class QrngPredictabilityEstimate:
+    """Assessment of whether Grover can predict QRNG output."""
+
+    has_predictive_oracle: bool
+    breakable: bool
+    reason: str
+
+
 def generate_bytes_with_secrets(num_bytes: int) -> bytes:
     """Generate random bytes from local CSPRNG."""
     return secrets.token_bytes(num_bytes)
@@ -241,6 +250,31 @@ def estimate_grover_only_attack(
     )
 
 
+def assess_qrng_predictability_under_grover(
+    has_predictive_oracle: bool = False,
+) -> QrngPredictabilityEstimate:
+    """Assess whether Grover can predict QRNG output.
+
+    Grover needs an oracle marking the correct state. Real QRNG output has no
+    such structure/oracle, so predictability attack is not possible.
+    """
+    if not has_predictive_oracle:
+        return QrngPredictabilityEstimate(
+            has_predictive_oracle=False,
+            breakable=False,
+            reason=(
+                "No oracle exists to mark the next QRNG output state; "
+                "Grover cannot be applied for prediction."
+            ),
+        )
+
+    return QrngPredictabilityEstimate(
+        has_predictive_oracle=True,
+        breakable=True,
+        reason="Hypothetical oracle granted; this is not a real QRNG setting.",
+    )
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command line args."""
     parser = argparse.ArgumentParser(
@@ -284,6 +318,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print private scalar and full shared secret (off by default).",
     )
+    parser.add_argument(
+        "--assume-predictive-oracle",
+        action="store_true",
+        help="Hypothetical mode only: assume an oracle for QRNG prediction.",
+    )
     return parser.parse_args()
 
 
@@ -300,6 +339,9 @@ def main() -> None:
             oracle_checks_per_second=args.oracle_rate,
             quantum_processors=args.quantum_processors,
             attack_window_years=args.attack_window_years,
+        )
+        qrng_predictability = assess_qrng_predictability_under_grover(
+            has_predictive_oracle=args.assume_predictive_oracle
         )
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -337,7 +379,11 @@ def main() -> None:
     print(f"Attack budget: {estimate.attack_window_years:g} years")
     print(f"Assessment: {estimate.reason}")
     print()
-    print("QRNG predictability broken by Grover: NO")
+    print(
+        "QRNG predictability broken by Grover:",
+        "YES" if qrng_predictability.breakable else "NO",
+    )
+    print(f"QRNG predictability assessment: {qrng_predictability.reason}")
     print(
         "FINAL RESULT - QRNG+ECDH broken by Grover-only attack:",
         "YES" if estimate.practical_break else "NO",

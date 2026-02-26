@@ -1,12 +1,13 @@
-"""Input-driven Grover/classical key-search demonstration.
+"""QRNG + ECDH security check against Grover-only attacks.
 
-This module demonstrates:
-1) Encrypting input text with a toy XOR key cipher.
-2) "Breaking" the ciphertext using classical brute-force key search.
-3) Reporting measured iteration timing on a classical computer.
-4) Estimating Grover iteration count for the same keyspace.
+This script demonstrates:
+1) ECDH private key generation from QRNG-like sources (qiskit/random.org/fallback).
+2) Real ECDH shared secret derivation.
+3) Practical attack estimates using only Grover-style search.
 
-The final output line always states whether the attack broke encryption.
+Key claim shown in output:
+Grover does not break QRNG itself, and Grover-only attacks are not practical
+for P-256 ECDH under realistic budgets.
 """
 
 from __future__ import annotations
@@ -15,255 +16,332 @@ import argparse
 from dataclasses import dataclass
 import math
 import secrets
-import time
+import sys
+from typing import Callable
+
+import requests
+from cryptography.hazmat.primitives.asymmetric import ec
+
+
+SECONDS_PER_YEAR = 365.25 * 24 * 60 * 60
+RANDOM_ORG_URL = "https://www.random.org/integers/"
+P256_ORDER = int(
+    "FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551", 16
+)
 
 
 @dataclass
-class AttackSetup:
-    """Parameters for the encryption and attack run."""
+class QrngKeyMaterial:
+    """Random material used to build the ECDH private key."""
 
-    key_bits: int
-    secret_key: int
-    ciphertext: bytes
-    known_prefix: bytes
+    source_used: str
+    source_note: str
+    random_bytes: bytes
+    private_scalar: int
 
 
 @dataclass
-class ClassicalAttackResult:
-    """Result of classical brute-force search."""
+class EcdhRun:
+    """Single ECDH run outputs."""
+
+    curve_name: str
+    order: int
+    order_bits: int
+    shared_secret_hex: str
+
+
+@dataclass
+class GroverEstimate:
+    """Attack-cost estimate using Grover-only assumptions."""
 
     keyspace_size: int
-    iterations_tested: int
-    elapsed_seconds: float
-    iterations_per_second: float
-    estimated_full_scan_seconds: float
-    estimated_average_break_seconds: float
-    broken: bool
-    recovered_key: int | None
-    recovered_plaintext: bytes | None
+    classical_pollard_steps: int
+    grover_steps: int
+    effective_oracle_rate: float
+    expected_runtime_years: float
+    attack_window_years: float
+    practical_break: bool
+    reason: str
 
 
-def xor_cipher(data: bytes, key: int, key_bits: int) -> bytes:
-    """Encrypt/decrypt bytes using repeating-key XOR from integer key."""
-    if key_bits <= 0:
-        raise ValueError("key_bits must be > 0")
-    if key < 0:
-        raise ValueError("key must be >= 0")
-
-    key_len = max(1, (key_bits + 7) // 8)
-    key_bytes = key.to_bytes(key_len, byteorder="big", signed=False)
-    return bytes(b ^ key_bytes[i % key_len] for i, b in enumerate(data))
+def generate_bytes_with_secrets(num_bytes: int) -> bytes:
+    """Generate random bytes from local CSPRNG."""
+    return secrets.token_bytes(num_bytes)
 
 
-def grover_iteration_estimate(keyspace_size: int) -> int:
-    """Estimate Grover iterations for one marked solution."""
-    if keyspace_size <= 0:
-        raise ValueError("keyspace_size must be > 0")
-    return math.ceil((math.pi / 4) * math.sqrt(keyspace_size))
+def generate_bits_with_qiskit(num_bits: int) -> str:
+    """Generate random bits using Qiskit measurement."""
+    if num_bits <= 0:
+        raise ValueError("num_bits must be > 0")
+
+    from qiskit import QuantumCircuit
+    from qiskit_aer import AerSimulator
+
+    qc = QuantumCircuit(num_bits, num_bits)
+    qc.h(range(num_bits))
+    qc.measure(range(num_bits), range(num_bits))
+
+    backend = AerSimulator()
+    job = backend.run(qc, shots=1, memory=True)
+    return job.result().get_memory()[0]
 
 
-def brute_force_xor_key(
-    ciphertext: bytes,
-    known_prefix: bytes,
-    key_bits: int,
-    max_iterations: int | None = None,
-) -> ClassicalAttackResult:
-    """Try all keys until plaintext prefix matches, measuring timing."""
-    keyspace_size = 1 << key_bits
-    iteration_limit = keyspace_size if max_iterations is None else min(max_iterations, keyspace_size)
+def generate_bytes_with_qiskit(num_bytes: int) -> bytes:
+    """Generate random bytes from Qiskit bits in manageable chunks."""
+    num_bits = num_bytes * 8
+    max_chunk_bits = 24
+    bit_chunks: list[str] = []
+    remaining = num_bits
 
-    start = time.perf_counter()
-    found_key: int | None = None
-    found_plaintext: bytes | None = None
+    while remaining > 0:
+        chunk_bits = min(max_chunk_bits, remaining)
+        bit_chunks.append(generate_bits_with_qiskit(chunk_bits))
+        remaining -= chunk_bits
 
-    for key in range(iteration_limit):
-        candidate = xor_cipher(ciphertext, key, key_bits)
-        if candidate.startswith(known_prefix):
-            found_key = key
-            found_plaintext = candidate
-            break
+    bits = "".join(bit_chunks)
+    value = int(bits, 2)
+    return value.to_bytes(num_bytes, "big")
 
-    elapsed = time.perf_counter() - start
-    tested = key + 1 if iteration_limit > 0 else 0
-    if found_key is None and iteration_limit > 0:
-        tested = iteration_limit
 
-    rate = (tested / elapsed) if elapsed > 0 and tested > 0 else 0.0
-    est_full = (keyspace_size / rate) if rate > 0 else float("inf")
-    est_avg = est_full / 2 if math.isfinite(est_full) else float("inf")
+def generate_bytes_with_random_org(num_bytes: int, timeout: float) -> bytes:
+    """Generate random bytes using random.org integer API."""
+    params = {
+        "num": num_bytes,
+        "min": 0,
+        "max": 255,
+        "col": 1,
+        "base": 10,
+        "format": "plain",
+        "rnd": "new",
+    }
+    response = requests.get(RANDOM_ORG_URL, params=params, timeout=timeout)
+    response.raise_for_status()
 
-    return ClassicalAttackResult(
-        keyspace_size=keyspace_size,
-        iterations_tested=tested,
-        elapsed_seconds=elapsed,
-        iterations_per_second=rate,
-        estimated_full_scan_seconds=est_full,
-        estimated_average_break_seconds=est_avg,
-        broken=found_key is not None,
-        recovered_key=found_key,
-        recovered_plaintext=found_plaintext,
+    lines = [line.strip() for line in response.text.splitlines() if line.strip()]
+    if len(lines) < num_bytes:
+        raise RuntimeError("random.org returned insufficient bytes.")
+    return bytes(int(v) for v in lines[:num_bytes])
+
+
+def resolve_qrng_bytes(
+    num_bytes: int, source: str, randomorg_timeout: float
+) -> tuple[bytes, str, str]:
+    """Resolve random bytes from requested or fallback source."""
+    if source == "secrets":
+        data = generate_bytes_with_secrets(num_bytes)
+        return data, "secrets", "Local CSPRNG used."
+
+    if source == "qiskit":
+        try:
+            data = generate_bytes_with_qiskit(num_bytes)
+            return data, "qiskit", "Qiskit measurement used."
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "Qiskit is not installed. Install qiskit + qiskit-aer, "
+                "or use --qrng-source randomorg/secrets."
+            ) from exc
+
+    if source == "randomorg":
+        try:
+            data = generate_bytes_with_random_org(num_bytes, randomorg_timeout)
+            return data, "randomorg", "random.org QRNG data used."
+        except requests.RequestException as exc:
+            raise RuntimeError(
+                "random.org request failed. Check network or use another source."
+            ) from exc
+
+    attempts: list[tuple[str, Callable[[], bytes]]] = [
+        ("qiskit", lambda: generate_bytes_with_qiskit(num_bytes)),
+        ("randomorg", lambda: generate_bytes_with_random_org(num_bytes, randomorg_timeout)),
+        ("secrets", lambda: generate_bytes_with_secrets(num_bytes)),
+    ]
+    errors: list[str] = []
+    for name, fn in attempts:
+        try:
+            data = fn()
+            return data, name, f"{name} source selected by auto fallback."
+        except Exception as exc:
+            errors.append(f"{name}: {exc}")
+
+    raise RuntimeError("All random sources failed: " + " | ".join(errors))
+
+
+def create_qrng_ecdh_scalar(source: str, randomorg_timeout: float) -> QrngKeyMaterial:
+    """Create a valid P-256 private scalar from random bytes."""
+    num_bytes = 32
+    random_bytes, source_used, source_note = resolve_qrng_bytes(
+        num_bytes=num_bytes,
+        source=source,
+        randomorg_timeout=randomorg_timeout,
+    )
+    random_int = int.from_bytes(random_bytes, "big")
+    scalar = (random_int % (P256_ORDER - 1)) + 1
+    return QrngKeyMaterial(
+        source_used=source_used,
+        source_note=source_note,
+        random_bytes=random_bytes,
+        private_scalar=scalar,
     )
 
 
-def format_seconds(seconds: float) -> str:
-    """Format seconds into a readable duration string."""
-    if not math.isfinite(seconds):
-        return "infinite"
+def run_ecdh_from_scalar(private_scalar: int) -> EcdhRun:
+    """Run an ECDH key exchange using a provided private scalar."""
+    private_key = ec.derive_private_key(private_scalar, ec.SECP256R1())
+    peer_private = ec.generate_private_key(ec.SECP256R1())
+    shared_secret = private_key.exchange(ec.ECDH(), peer_private.public_key())
 
-    minute = 60
-    hour = 60 * minute
-    day = 24 * hour
-    year = 365.25 * day
+    return EcdhRun(
+        curve_name="secp256r1 (P-256)",
+        order=P256_ORDER,
+        order_bits=P256_ORDER.bit_length(),
+        shared_secret_hex=shared_secret.hex(),
+    )
 
-    if seconds < minute:
-        return f"{seconds:.6f} s"
-    if seconds < hour:
-        return f"{seconds / minute:.4f} min"
-    if seconds < day:
-        return f"{seconds / hour:.4f} h"
-    if seconds < year:
-        return f"{seconds / day:.4f} days"
-    return f"{seconds / year:.4f} years"
+
+def estimate_grover_only_attack(
+    keyspace_size: int,
+    oracle_checks_per_second: float,
+    quantum_processors: int,
+    attack_window_years: float,
+) -> GroverEstimate:
+    """Estimate Grover-only practicality for ECDH key search."""
+    if keyspace_size <= 0:
+        raise ValueError("keyspace_size must be > 0")
+    if oracle_checks_per_second <= 0:
+        raise ValueError("oracle_checks_per_second must be > 0")
+    if quantum_processors <= 0:
+        raise ValueError("quantum_processors must be > 0")
+    if attack_window_years <= 0:
+        raise ValueError("attack_window_years must be > 0")
+
+    sqrt_n = math.sqrt(keyspace_size)
+    classical_pollard_steps = math.ceil(math.sqrt(math.pi * keyspace_size / 2))
+    grover_steps = math.ceil((math.pi / 4) * sqrt_n)
+
+    effective_rate = oracle_checks_per_second * quantum_processors
+    runtime_seconds = grover_steps / effective_rate
+    runtime_years = runtime_seconds / SECONDS_PER_YEAR
+    practical_break = runtime_years <= attack_window_years
+
+    reason = (
+        "Grover search fits in the provided budget."
+        if practical_break
+        else "Grover search does not fit in the provided budget."
+    )
+
+    return GroverEstimate(
+        keyspace_size=keyspace_size,
+        classical_pollard_steps=classical_pollard_steps,
+        grover_steps=grover_steps,
+        effective_oracle_rate=effective_rate,
+        expected_runtime_years=runtime_years,
+        attack_window_years=attack_window_years,
+        practical_break=practical_break,
+        reason=reason,
+    )
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse CLI arguments."""
+    """Parse command line args."""
     parser = argparse.ArgumentParser(
-        description="Run an input-driven classical key-search break and Grover estimate."
+        description=(
+            "Demonstrate that QRNG is not broken by Grover and "
+            "Grover-only ECDH key search is impractical for P-256."
+        )
     )
     parser.add_argument(
-        "--message",
-        type=str,
-        default=None,
-        help="Plaintext message to encrypt first (if omitted, interactive prompt is used).",
+        "--qrng-source",
+        choices=["auto", "qiskit", "randomorg", "secrets"],
+        default="auto",
+        help="Random source for ECDH private scalar (default: auto).",
     )
     parser.add_argument(
-        "--known-prefix",
-        type=str,
-        default=None,
-        help="Known plaintext prefix used for key validation.",
+        "--randomorg-timeout",
+        type=float,
+        default=10.0,
+        help="Timeout seconds for random.org source (default: 10).",
     )
     parser.add_argument(
-        "--key-bits",
+        "--oracle-rate",
+        type=float,
+        default=1e12,
+        help="Oracle checks per second per quantum processor (default: 1e12).",
+    )
+    parser.add_argument(
+        "--quantum-processors",
         type=int,
-        default=16,
-        help="Key size for toy cipher brute force (default: 16).",
+        default=1_000_000,
+        help="Number of parallel quantum processors (default: 1,000,000).",
     )
     parser.add_argument(
-        "--key",
-        type=str,
-        default=None,
-        help="Secret key as int (supports 0x...); if omitted, random key is used.",
+        "--attack-window-years",
+        type=float,
+        default=10.0,
+        help="Allowed attacker time budget in years (default: 10).",
     )
     parser.add_argument(
-        "--max-iterations",
-        type=int,
-        default=None,
-        help="Optional cap on tested keys.",
+        "--show-sensitive",
+        action="store_true",
+        help="Print private scalar and full shared secret (off by default).",
     )
     return parser.parse_args()
 
 
-def collect_input(args: argparse.Namespace) -> AttackSetup:
-    """Build attack setup from args or interactive input."""
-    key_bits = args.key_bits
-    if key_bits <= 0:
-        raise ValueError("key_bits must be > 0")
-
-    keyspace_size = 1 << key_bits
-
-    message = args.message
-    if message is None:
-        message = input("Enter message to encrypt and attack: ").strip()
-        if not message:
-            raise ValueError("message cannot be empty")
-
-    if args.key is None:
-        secret_key = secrets.randbelow(keyspace_size)
-    else:
-        secret_key = int(args.key, 0)
-        if secret_key < 0 or secret_key >= keyspace_size:
-            raise ValueError(f"key must be in range [0, {keyspace_size - 1}]")
-
-    plaintext = message.encode("utf-8")
-    ciphertext = xor_cipher(plaintext, secret_key, key_bits)
-
-    known_prefix_text = args.known_prefix
-    if known_prefix_text is None:
-        prefix_len = 4 if len(message) >= 4 else len(message)
-        known_prefix_text = message[:prefix_len]
-    known_prefix = known_prefix_text.encode("utf-8")
-
-    if not known_prefix:
-        raise ValueError("known prefix cannot be empty")
-
-    return AttackSetup(
-        key_bits=key_bits,
-        secret_key=secret_key,
-        ciphertext=ciphertext,
-        known_prefix=known_prefix,
-    )
-
-
 def main() -> None:
-    """Run encryption, classical break, and Grover iteration estimate."""
+    """Run QRNG + ECDH + Grover-only assessment."""
     args = parse_args()
-    setup = collect_input(args)
+    try:
+        material = create_qrng_ecdh_scalar(
+            source=args.qrng_source, randomorg_timeout=args.randomorg_timeout
+        )
+        ecdh = run_ecdh_from_scalar(material.private_scalar)
+        estimate = estimate_grover_only_attack(
+            keyspace_size=ecdh.order - 1,
+            oracle_checks_per_second=args.oracle_rate,
+            quantum_processors=args.quantum_processors,
+            attack_window_years=args.attack_window_years,
+        )
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1)
 
-    if setup.key_bits > 28 and args.max_iterations is None:
-        print("Large key size detected; auto-capping to 5,000,000 iterations.")
-        max_iterations = 5_000_000
+    print("QRNG + ECDH Grover-Only Assessment")
+    print("=" * 64)
+    print(f"Curve: {ecdh.curve_name}")
+    print(f"Curve order bits: {ecdh.order_bits}")
+    print(f"QRNG source used: {material.source_used}")
+    print(f"Source note: {material.source_note}")
+    print(f"Random seed bytes (hex, first 16): {material.random_bytes[:16].hex()}...")
+    if args.show_sensitive:
+        print(f"ECDH private scalar: {material.private_scalar}")
+        print(f"ECDH shared secret (hex): {ecdh.shared_secret_hex}")
     else:
-        max_iterations = args.max_iterations
-
-    result = brute_force_xor_key(
-        ciphertext=setup.ciphertext,
-        known_prefix=setup.known_prefix,
-        key_bits=setup.key_bits,
-        max_iterations=max_iterations,
-    )
-
-    grover_iters = grover_iteration_estimate(result.keyspace_size)
-    grover_time_on_same_rate = (
-        grover_iters / result.iterations_per_second
-        if result.iterations_per_second > 0
-        else float("inf")
-    )
-
-    print("Grover + Classical Key-Search Report")
-    print("-" * 55)
-    print(f"Key bits: {setup.key_bits}")
-    print(f"Keyspace size: {result.keyspace_size:,}")
-    print(f"Ciphertext (hex): {setup.ciphertext.hex()}")
-    print(f"Known prefix used for attack: {setup.known_prefix.decode('utf-8', errors='replace')}")
+        print(
+            "ECDH shared secret (hex, first 16): "
+            f"{ecdh.shared_secret_hex[:32]}..."
+        )
     print()
-    print("Classical brute-force timing")
-    print("-" * 55)
-    print(f"Iterations tested: {result.iterations_tested:,}")
-    print(f"Measured attack time: {format_seconds(result.elapsed_seconds)}")
-    print(f"Iteration rate (classical CPU): {result.iterations_per_second:,.2f} keys/s")
-    print(f"Estimated full keyspace scan time: {format_seconds(result.estimated_full_scan_seconds)}")
-    print(f"Estimated average break time: {format_seconds(result.estimated_average_break_seconds)}")
-    print()
-    print("Grover iteration estimate")
-    print("-" * 55)
-    print(f"Estimated Grover iterations: {grover_iters:,}")
+    print("Grover-Only Attack Estimate")
+    print("-" * 64)
+    print(f"Search space size (~curve order): {estimate.keyspace_size:,}")
     print(
-        "Estimated time for that many iterations at same classical rate:",
-        format_seconds(grover_time_on_same_rate),
+        "Classical generic ECDLP cost (Pollard rho, expected steps): "
+        f"{estimate.classical_pollard_steps:,}"
     )
+    print(f"Grover required iterations: {estimate.grover_steps:,}")
+    print(
+        "Effective oracle rate (checks/sec): "
+        f"{estimate.effective_oracle_rate:,.2f}"
+    )
+    print(f"Estimated Grover runtime: {estimate.expected_runtime_years:,.2e} years")
+    print(f"Attack budget: {estimate.attack_window_years:g} years")
+    print(f"Assessment: {estimate.reason}")
     print()
-
-    if result.broken:
-        recovered_text = result.recovered_plaintext.decode("utf-8", errors="replace")
-        print(f"Recovered key: {result.recovered_key}")
-        print(f"Recovered plaintext: {recovered_text}")
-    else:
-        print("No key found in the tested iteration range.")
-
-    print()
-    print("FINAL RESULT - Encryption broken by classical attack:",
-          "YES" if result.broken else "NO")
+    print("QRNG predictability broken by Grover: NO")
+    print(
+        "FINAL RESULT - QRNG+ECDH broken by Grover-only attack:",
+        "YES" if estimate.practical_break else "NO",
+    )
 
 
 if __name__ == "__main__":

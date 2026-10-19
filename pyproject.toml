@@ -60,10 +60,10 @@ docs = [
 qrngsim = "qrngsim.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/yourusername/qrngsim"
-Documentation = "https://github.com/yourusername/qrngsim#readme"
-Repository = "https://github.com/yourusername/qrngsim"
-Issues = "https://github.com/yourusername/qrngsim/issues"
+Homepage = "https://github.com/arif481/Final_Year_Project"
+Documentation = "https://github.com/arif481/Final_Year_Project#readme"
+Repository = "https://github.com/arif481/Final_Year_Project"
+Issues = "https://github.com/arif481/Final_Year_Project/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
